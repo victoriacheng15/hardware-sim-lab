@@ -1,0 +1,100 @@
+package telemetry
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	metricapi "go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"google.golang.org/grpc"
+)
+
+func GetMeter(name string) metricapi.Meter {
+	if name == "" {
+		name = ScopeName
+	}
+	return otel.Meter(name)
+}
+
+func NewInt64Counter(meter metricapi.Meter, name, description string) (metricapi.Int64Counter, error) {
+	opts := []metricapi.Int64CounterOption{}
+	if description != "" {
+		opts = append(opts, metricapi.WithDescription(description))
+	}
+	return meter.Int64Counter(name, opts...)
+}
+
+func NewInt64Histogram(meter metricapi.Meter, name, description, unit string) (metricapi.Int64Histogram, error) {
+	opts := []metricapi.Int64HistogramOption{}
+	if description != "" {
+		opts = append(opts, metricapi.WithDescription(description))
+	}
+	if unit != "" {
+		opts = append(opts, metricapi.WithUnit(unit))
+	}
+	return meter.Int64Histogram(name, opts...)
+}
+
+func NewFloat64Histogram(meter metricapi.Meter, name, description, unit string) (metricapi.Float64Histogram, error) {
+	opts := []metricapi.Float64HistogramOption{}
+	if description != "" {
+		opts = append(opts, metricapi.WithDescription(description))
+	}
+	if unit != "" {
+		opts = append(opts, metricapi.WithUnit(unit))
+	}
+	return meter.Float64Histogram(name, opts...)
+}
+
+func AddInt64Counter(ctx context.Context, counter metricapi.Int64Counter, value int64, attrs ...Attribute) {
+	counter.Add(ctx, value, metricapi.WithAttributes(attrs...))
+}
+
+func RecordInt64Histogram(ctx context.Context, histogram metricapi.Int64Histogram, value int64, attrs ...Attribute) {
+	histogram.Record(ctx, value, metricapi.WithAttributes(attrs...))
+}
+
+func RecordFloat64Histogram(ctx context.Context, histogram metricapi.Float64Histogram, value float64, attrs ...Attribute) {
+	histogram.Record(ctx, value, metricapi.WithAttributes(attrs...))
+}
+
+func WithMetricAttributes(attrs ...Attribute) metricapi.ObserveOption {
+	return metricapi.WithAttributes(attrs...)
+}
+
+func NewInt64ObservableGauge(meter metricapi.Meter, name, description string, callback func(context.Context, metricapi.Int64Observer) error) (metricapi.Int64ObservableGauge, error) {
+	opts := []metricapi.Int64ObservableGaugeOption{}
+	if description != "" {
+		opts = append(opts, metricapi.WithDescription(description))
+	}
+	return meter.Int64ObservableGauge(name, append(opts, metricapi.WithInt64Callback(callback))...)
+}
+
+func NewFloat64ObservableGauge(meter metricapi.Meter, name, description string, callback func(context.Context, metricapi.Float64Observer) error) (metricapi.Float64ObservableGauge, error) {
+	opts := []metricapi.Float64ObservableGaugeOption{}
+	if description != "" {
+		opts = append(opts, metricapi.WithDescription(description))
+	}
+	return meter.Float64ObservableGauge(name, append(opts, metricapi.WithFloat64Callback(callback))...)
+}
+
+func initMetrics(ctx context.Context, conn *grpc.ClientConn, res *resource.Resource) (func(context.Context) error, error) {
+	metricExporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metric exporter: %w", err)
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(
+			sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(3*time.Second)),
+		),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+
+	return mp.Shutdown, nil
+}
