@@ -97,6 +97,23 @@ type ShadowState struct {
 	UpdatedAt       time.Time
 }
 
+func (s ShadowState) Properties() []string {
+	properties := make([]string, 0, 4)
+	if s.Temperature != nil {
+		properties = append(properties, "temperature")
+	}
+	if s.Voltage != nil {
+		properties = append(properties, "voltage")
+	}
+	if s.DeviceState != nil {
+		properties = append(properties, "device_state")
+	}
+	if s.FirmwareVersion != nil {
+		properties = append(properties, "firmware_version")
+	}
+	return properties
+}
+
 type deviceState struct {
 	SequenceNumber uint64
 	UptimeSeconds  int64

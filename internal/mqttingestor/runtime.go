@@ -2,8 +2,10 @@ package mqttingestor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -20,6 +22,7 @@ const (
 
 var DefaultTopics = []string{
 	"devices/+/telemetry",
+	"devices/+/shadow/update",
 	"sensors/thermal",
 }
 
@@ -73,8 +76,22 @@ type messageEvent struct {
 type messageResult struct {
 	analysis Analysis
 	invalid  bool
+	metrics  bool
 	err      error
 	events   []messageEvent
+}
+
+type topicRoute int
+
+const (
+	topicRouteTelemetry topicRoute = iota
+	topicRouteShadowUpdate
+	topicRouteUnknown
+)
+
+type routedTopic struct {
+	route    topicRoute
+	deviceID string
 }
 
 func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
@@ -135,20 +152,42 @@ func (r *Runtime) subscribe(c client) {
 }
 
 func (r *Runtime) evaluateMessage(topic string, payload []byte, receivedAt time.Time) messageResult {
+	route := parseTopicRoute(topic)
+	if route.route == topicRouteShadowUpdate {
+		shadow, err := r.processor.ProcessShadowUpdate(route.deviceID, payload, receivedAt)
+		if err != nil {
+			return invalidMessageResult(topic, err)
+		}
+
+		return messageResult{
+			events: []messageEvent{{
+				name: "digital_twin_shadow_updated",
+				attrs: []any{
+					"topic", topic,
+					"device_id", route.deviceID,
+					"properties", shadow.Properties(),
+				},
+			}},
+		}
+	}
+
+	if route.route == topicRouteTelemetry && route.deviceID != "" {
+		payloadDeviceID, ok, err := extractPayloadDeviceID(payload)
+		if err != nil {
+			return invalidMessageResult(topic, err)
+		}
+		if ok && payloadDeviceID != route.deviceID {
+			return invalidMessageResult(
+				topic,
+				fmt.Errorf("%w: topic device_id %q does not match payload device_id %q", ErrInvalidPayload, route.deviceID, payloadDeviceID),
+			)
+		}
+	}
+
 	analysis, err := r.processor.Process(payload, receivedAt)
 	if err != nil {
 		if errors.Is(err, ErrMalformedPayload) || errors.Is(err, ErrInvalidPayload) {
-			return messageResult{
-				invalid: true,
-				err:     err,
-				events: []messageEvent{{
-					name: "mqtt_payload_invalid",
-					attrs: []any{
-						"topic", topic,
-						"error", err.Error(),
-					},
-				}},
-			}
+			return invalidMessageResult(topic, err)
 		}
 
 		return messageResult{err: err}
@@ -156,6 +195,7 @@ func (r *Runtime) evaluateMessage(topic string, payload []byte, receivedAt time.
 
 	result := messageResult{
 		analysis: analysis,
+		metrics:  true,
 		events: []messageEvent{{
 			name: "mqtt_message_received",
 			attrs: []any{
@@ -241,6 +281,9 @@ func (r *Runtime) recordResult(ctx context.Context, result messageResult) {
 		telemetry.AddInt64Counter(ctx, r.metrics.invalidMessagesTotal, 1, telemetry.StringAttribute("environment", r.config.Environment))
 		return
 	}
+	if !result.metrics {
+		return
+	}
 
 	analysis := result.analysis
 	commonAttrs := []telemetry.Attribute{
@@ -291,6 +334,49 @@ func (r *Runtime) subscriptionFilters() map[string]byte {
 		filters[topic] = 1
 	}
 	return filters
+}
+
+func parseTopicRoute(topic string) routedTopic {
+	if topic == "sensors/thermal" {
+		return routedTopic{route: topicRouteTelemetry}
+	}
+
+	parts := strings.Split(topic, "/")
+	if len(parts) == 3 && parts[0] == "devices" && parts[1] != "" && parts[2] == "telemetry" {
+		return routedTopic{route: topicRouteTelemetry, deviceID: parts[1]}
+	}
+	if len(parts) == 4 && parts[0] == "devices" && parts[1] != "" && parts[2] == "shadow" && parts[3] == "update" {
+		return routedTopic{route: topicRouteShadowUpdate, deviceID: parts[1]}
+	}
+
+	return routedTopic{route: topicRouteUnknown}
+}
+
+func extractPayloadDeviceID(payload []byte) (string, bool, error) {
+	var envelope struct {
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return "", false, fmt.Errorf("%w: %v", ErrMalformedPayload, err)
+	}
+	if envelope.DeviceID == "" {
+		return "", false, nil
+	}
+	return envelope.DeviceID, true, nil
+}
+
+func invalidMessageResult(topic string, err error) messageResult {
+	return messageResult{
+		invalid: true,
+		err:     err,
+		events: []messageEvent{{
+			name: "mqtt_payload_invalid",
+			attrs: []any{
+				"topic", topic,
+				"error", err.Error(),
+			},
+		}},
+	}
 }
 
 func (cfg RuntimeConfig) withDefaults() RuntimeConfig {
