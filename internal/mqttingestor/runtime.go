@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -66,6 +67,8 @@ type runtimeMetrics struct {
 	freeHeap             telemetry.Int64Histogram
 	loopTime             telemetry.Float64Histogram
 	uptime               telemetry.Int64Histogram
+	shadowDrift          telemetry.Float64Histogram
+	shadowStatusMatch    telemetry.Int64Histogram
 }
 
 type messageEvent struct {
@@ -79,6 +82,12 @@ type messageResult struct {
 	metrics  bool
 	err      error
 	events   []messageEvent
+}
+
+type twinMetricRecord struct {
+	name  string
+	value float64
+	attrs []telemetry.Attribute
 }
 
 type topicRoute int
@@ -259,6 +268,7 @@ func (r *Runtime) evaluateMessage(topic string, payload []byte, receivedAt time.
 			},
 		})
 	}
+	result.events = append(result.events, digitalTwinSyncEvents(analysis)...)
 
 	return result
 }
@@ -321,6 +331,14 @@ func (r *Runtime) recordResult(ctx context.Context, result messageResult) {
 			append(commonAttrs, telemetry.StringAttribute("reboot_reason", analysis.Message.RebootReason))...,
 		)
 	}
+	for _, record := range digitalTwinMetricRecords(r.config.Environment, analysis) {
+		switch record.name {
+		case "hardware.shadow.drift":
+			telemetry.RecordFloat64Histogram(ctx, r.metrics.shadowDrift, record.value, record.attrs...)
+		case "hardware.shadow.status_match":
+			telemetry.RecordInt64Histogram(ctx, r.metrics.shadowStatusMatch, int64(record.value), record.attrs...)
+		}
+	}
 }
 
 func (r *Runtime) handleMQTTMessage(_ mqtt.Client, msg mqtt.Message) {
@@ -377,6 +395,78 @@ func invalidMessageResult(topic string, err error) messageResult {
 			},
 		}},
 	}
+}
+
+func digitalTwinSyncEvents(analysis Analysis) []messageEvent {
+	if !analysis.Twin.ShadowFound {
+		return nil
+	}
+
+	events := make([]messageEvent, 0, len(analysis.Twin.NumericDrifts)+len(analysis.Twin.StatusComparisons))
+	for _, drift := range analysis.Twin.NumericDrifts {
+		events = append(events, messageEvent{
+			name: "digital_twin_sync_check",
+			attrs: []any{
+				"device_id", analysis.Message.DeviceID,
+				"property", drift.Property,
+				"reported", drift.Reported,
+				"desired", drift.Desired,
+				"drift", drift.Drift,
+				"status", string(analysis.Twin.SyncStatus),
+			},
+		})
+	}
+	for _, comparison := range analysis.Twin.StatusComparisons {
+		events = append(events, messageEvent{
+			name: "digital_twin_sync_check",
+			attrs: []any{
+				"device_id", analysis.Message.DeviceID,
+				"property", comparison.Property,
+				"reported", comparison.Reported,
+				"desired", comparison.Desired,
+				"match", comparison.Match,
+				"status", string(analysis.Twin.SyncStatus),
+			},
+		})
+	}
+
+	return events
+}
+
+func digitalTwinMetricRecords(environment string, analysis Analysis) []twinMetricRecord {
+	if !analysis.Twin.ShadowFound {
+		return nil
+	}
+
+	records := make([]twinMetricRecord, 0, len(analysis.Twin.NumericDrifts)+len(analysis.Twin.StatusComparisons))
+	for _, drift := range analysis.Twin.NumericDrifts {
+		records = append(records, twinMetricRecord{
+			name:  "hardware.shadow.drift",
+			value: math.Abs(drift.Drift),
+			attrs: []telemetry.Attribute{
+				telemetry.StringAttribute("environment", environment),
+				telemetry.StringAttribute("device_id", analysis.Message.DeviceID),
+				telemetry.StringAttribute("property", drift.Property),
+			},
+		})
+	}
+	for _, comparison := range analysis.Twin.StatusComparisons {
+		value := 0.0
+		if comparison.Match {
+			value = 1
+		}
+		records = append(records, twinMetricRecord{
+			name:  "hardware.shadow.status_match",
+			value: value,
+			attrs: []telemetry.Attribute{
+				telemetry.StringAttribute("environment", environment),
+				telemetry.StringAttribute("device_id", analysis.Message.DeviceID),
+				telemetry.StringAttribute("property", comparison.Property),
+			},
+		})
+	}
+
+	return records
 }
 
 func (cfg RuntimeConfig) withDefaults() RuntimeConfig {
@@ -465,6 +555,14 @@ func newRuntimeMetrics() (runtimeMetrics, error) {
 	if err != nil {
 		return runtimeMetrics{}, fmt.Errorf("create uptime histogram: %w", err)
 	}
+	shadowDrift, err := telemetry.NewFloat64Histogram(meter, "hardware.shadow.drift", "Digital twin absolute desired versus reported numeric drift", "")
+	if err != nil {
+		return runtimeMetrics{}, fmt.Errorf("create shadow drift histogram: %w", err)
+	}
+	shadowStatusMatch, err := telemetry.NewInt64Histogram(meter, "hardware.shadow.status_match", "Digital twin desired versus reported status match", "")
+	if err != nil {
+		return runtimeMetrics{}, fmt.Errorf("create shadow status match histogram: %w", err)
+	}
 
 	return runtimeMetrics{
 		messagesTotal:        messagesTotal,
@@ -483,5 +581,7 @@ func newRuntimeMetrics() (runtimeMetrics, error) {
 		freeHeap:             freeHeap,
 		loopTime:             loopTime,
 		uptime:               uptime,
+		shadowDrift:          shadowDrift,
+		shadowStatusMatch:    shadowStatusMatch,
 	}, nil
 }
